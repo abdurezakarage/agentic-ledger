@@ -19,6 +19,10 @@ class LoanApplicationAggregate:
     has_human_override: bool = False
     version: int = 0
 
+    def _require_transition(self, *allowed_from: ApplicationState | None) -> None:
+        if self.state not in allowed_from:
+            raise DomainError(f"Invalid transition from {self.state}")
+
     @classmethod
     async def load(cls, store: EventStore, application_id: str) -> "LoanApplicationAggregate":
         agg = cls(application_id=application_id)
@@ -43,14 +47,17 @@ class LoanApplicationAggregate:
             raise DomainError("Cannot approve without compliance clearance")
 
     def _on_ApplicationSubmitted(self, event: StoredEvent) -> None:
+        self._require_transition(None)
         self.state = ApplicationState.SUBMITTED
         self.applicant_id = event.payload.get("applicant_id")
         self.requested_amount_usd = event.payload.get("requested_amount_usd")
 
     def _on_CreditAnalysisRequested(self, _: StoredEvent) -> None:
+        self._require_transition(ApplicationState.SUBMITTED)
         self.state = ApplicationState.AWAITING_ANALYSIS
 
     def _on_CreditAnalysisCompleted(self, event: StoredEvent) -> None:
+        self._require_transition(ApplicationState.SUBMITTED, ApplicationState.AWAITING_ANALYSIS)
         if self.has_credit_analysis and not self.has_human_override:
             raise DomainError("Credit analysis already completed and not superseded")
         self.has_credit_analysis = True
@@ -58,10 +65,12 @@ class LoanApplicationAggregate:
         self.state = ApplicationState.ANALYSIS_COMPLETE
 
     def _on_ComplianceRulePassed(self, _: StoredEvent) -> None:
+        self._require_transition(ApplicationState.ANALYSIS_COMPLETE, ApplicationState.COMPLIANCE_REVIEW)
         self.state = ApplicationState.COMPLIANCE_REVIEW
         self.compliance_cleared = True
 
     def _on_DecisionGenerated(self, event: StoredEvent) -> None:
+        self._require_transition(ApplicationState.ANALYSIS_COMPLETE, ApplicationState.COMPLIANCE_REVIEW, ApplicationState.PENDING_DECISION)
         confidence = float(event.payload.get("confidence_score", 0))
         recommendation = event.payload.get("recommendation", "REFER")
         if confidence < 0.6 and recommendation != "REFER":
@@ -69,6 +78,7 @@ class LoanApplicationAggregate:
         self.state = ApplicationState.PENDING_DECISION
 
     def _on_HumanReviewCompleted(self, event: StoredEvent) -> None:
+        self._require_transition(ApplicationState.PENDING_DECISION, ApplicationState.APPROVED_PENDING_HUMAN, ApplicationState.DECLINED_PENDING_HUMAN)
         if event.payload.get("override"):
             self.has_human_override = True
         final_decision = event.payload.get("final_decision")

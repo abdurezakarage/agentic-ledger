@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 
 from src.event_store import EventStore
 from src.models.events import StoredEvent
@@ -20,7 +21,9 @@ class ComplianceAuditProjection:
                 "INSERT INTO compliance_audit_view(application_id, as_of, data) VALUES ($1,$2,$3::jsonb)",
                 app_id,
                 event.recorded_at,
-                {"event_type": event.event_type, "payload": event.payload, "recorded_at": event.recorded_at.isoformat()},
+                json.dumps(
+                    {"event_type": event.event_type, "payload": event.payload, "recorded_at": event.recorded_at.isoformat()}
+                ),
             )
 
     async def get_current_compliance(self, store: EventStore, application_id: str) -> dict:

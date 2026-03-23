@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.commands.handlers import (
+    _append,
     CreditAnalysisCompletedCommand,
     SubmitApplicationCommand,
     handle_compliance_check,
@@ -73,7 +74,29 @@ async def record_credit_analysis(store: EventStore, payload: dict) -> dict:
 
 
 async def record_fraud_screening(store: EventStore, payload: dict) -> dict:
-    return {"event_id": "not-implemented", "new_stream_version": await store.stream_version(f"loan-{payload['application_id']}")}
+    try:
+        score = float(payload["fraud_score"])
+        if score < 0.0 or score > 1.0:
+            raise ValueError("fraud_score must be 0.0-1.0")
+        app_stream = f"loan-{payload['application_id']}"
+        current = await store.stream_version(app_stream)
+        new_version = await _append(
+            store,
+            app_stream,
+            "FraudScreeningCompleted",
+            {
+                "application_id": payload["application_id"],
+                "agent_id": payload["agent_id"],
+                "fraud_score": score,
+                "anomaly_flags": payload.get("anomaly_flags", []),
+                "screening_model_version": payload.get("screening_model_version", "unknown"),
+                "input_data_hash": payload.get("input_data_hash", ""),
+            },
+            current,
+        )
+        return {"event_id": f"{app_stream}:{new_version}", "new_stream_version": new_version}
+    except Exception as exc:
+        return {"error": _structured_error(exc).__dict__}
 
 
 async def record_compliance_check(store: EventStore, payload: dict) -> dict:

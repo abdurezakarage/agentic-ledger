@@ -36,6 +36,8 @@ class AgentSessionAggregate:
             raise DomainError("Model version mismatch for locked session")
 
     def _apply(self, event: StoredEvent) -> None:
+        if event.stream_position == 1 and event.event_type != "AgentContextLoaded":
+            raise DomainError("First AgentSession event must be AgentContextLoaded")
         handler = getattr(self, f"_on_{event.event_type}", None)
         if handler is None:
             self.version = event.stream_position
@@ -48,6 +50,11 @@ class AgentSessionAggregate:
         self.model_version = event.payload.get("model_version")
 
     def _on_CreditAnalysisCompleted(self, event: StoredEvent) -> None:
+        app_id = event.payload.get("application_id")
+        if app_id:
+            self.applications_seen.add(app_id)
+
+    def _on_FraudScreeningCompleted(self, event: StoredEvent) -> None:
         app_id = event.payload.get("application_id")
         if app_id:
             self.applications_seen.add(app_id)

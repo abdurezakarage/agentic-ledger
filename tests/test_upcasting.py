@@ -15,7 +15,7 @@ async def test_upcasting_does_not_mutate_stored_payload():
         pytest.skip("DATABASE_URL not set")
 
     class CreditV1(BaseEvent):
-        event_type = "CreditAnalysisCompleted"
+        event_type: str = "CreditAnalysisCompleted"
         application_id: str
         decision: str
         reason: str

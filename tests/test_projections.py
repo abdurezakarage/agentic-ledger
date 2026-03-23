@@ -11,7 +11,7 @@ from src.projections.daemon import ProjectionDaemon
 
 
 class E(BaseEvent):
-    event_type = "ApplicationSubmitted"
+    event_type: str = "ApplicationSubmitted"
     application_id: str
     applicant_id: str
     requested_amount_usd: float

@@ -71,6 +71,13 @@ async def handle_credit_analysis_completed(cmd: CreditAnalysisCompletedCommand, 
         "input_data_hash": cmd.input_data_hash,
     }
     await _append(store, f"loan-{cmd.application_id}", "CreditAnalysisCompleted", payload, app.version)
+    await _append(
+        store,
+        f"agent-{cmd.agent_id}-{cmd.session_id}",
+        "CreditAnalysisCompleted",
+        payload,
+        agent.version,
+    )
 
 
 async def handle_start_agent_session(
@@ -99,6 +106,19 @@ async def handle_compliance_check(
     store: EventStore, application_id: str, rule_id: str, rule_version: str, passed: bool
 ) -> None:
     agg = await ComplianceRecordAggregate.load(store, application_id)
+    if agg.version == 0:
+        await _append(
+            store,
+            f"compliance-{application_id}",
+            "ComplianceCheckRequested",
+            {
+                "application_id": application_id,
+                "regulation_set_version": rule_version,
+                "checks_required": [rule_id],
+            },
+            -1,
+        )
+        agg = await ComplianceRecordAggregate.load(store, application_id)
     event_type = "ComplianceRulePassed" if passed else "ComplianceRuleFailed"
     payload = {
         "application_id": application_id,

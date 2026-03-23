@@ -44,7 +44,7 @@ async def test_double_decision_concurrency_expected_version_3():
 
         # Seed 3 events so stream_version == 3.
         class SeedEvent(BaseEvent):
-            event_type = "SeedEvent"
+            event_type: str = "SeedEvent"
             value: str
 
         await store.append(stream_id=stream_id, events=[SeedEvent(value="1")], expected_version=-1)

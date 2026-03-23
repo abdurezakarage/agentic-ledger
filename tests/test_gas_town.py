@@ -9,7 +9,7 @@ from src.models.events import BaseEvent
 
 
 class AgentEvent(BaseEvent):
-    event_type = "AgentWorkStep"
+    event_type: str = "AgentWorkStep"
     agent_id: str
     session_id: str
     step: str
