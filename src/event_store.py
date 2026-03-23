@@ -1,30 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence
-from uuid import UUID
+import json
+from typing import Any, AsyncIterator, Optional
 
 import asyncpg
 
-from src.models.events import OptimisticConcurrencyError, StoredEvent, StreamMetadata
-
-
-@dataclass(frozen=True)
-class _AppendRow:
-    event_type: str
-    event_version: int
-    occurred_at: datetime
-    payload: Dict[str, Any]
-    metadata: Dict[str, Any]
-    correlation_id: Optional[UUID]
-    causation_id: Optional[UUID]
+from src.models.events import BaseEvent, OptimisticConcurrencyError, StoredEvent, StreamMetadata
 
 
 class EventStore:
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, upcaster_registry: Any | None = None):
         self._dsn = dsn
         self._pool: Optional[asyncpg.Pool] = None
+        self._upcaster_registry = upcaster_registry
 
     async def connect(self) -> None:
         if self._pool is None:
@@ -40,250 +28,186 @@ class EventStore:
             raise RuntimeError("EventStore is not connected. Call await connect().")
         return self._pool
 
-    async def get_stream_metadata(self, stream_id: UUID) -> Optional[StreamMetadata]:
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT s.stream_id, s.stream_type, s.created_at, s.archived_at, s.metadata,
-                       COALESCE((SELECT MAX(e.version) FROM events e WHERE e.stream_id = s.stream_id), 0) AS last_version
-                FROM event_streams s
-                WHERE s.stream_id = $1
-                """,
-                stream_id,
-            )
-            if row is None:
-                return None
-            return StreamMetadata(
-                stream_id=row["stream_id"],
-                stream_type=row["stream_type"],
-                created_at=row["created_at"],
-                archived_at=row["archived_at"],
-                metadata=dict(row["metadata"] or {}),
-                last_version=row["last_version"],
-            )
-
-    async def stream_version(self, stream_id: UUID) -> int:
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT COALESCE(MAX(version), 0) AS v FROM events WHERE stream_id = $1",
-                stream_id,
-            )
-            return int(row["v"])
-
-    async def archive_stream(self, stream_id: UUID) -> None:
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE event_streams SET archived_at = now() WHERE stream_id = $1",
-                stream_id,
-            )
+    @staticmethod
+    def _row_to_event(row: Any) -> StoredEvent:
+        data = dict(row)
+        if isinstance(data.get("payload"), str):
+            data["payload"] = json.loads(data["payload"])
+        if isinstance(data.get("metadata"), str):
+            data["metadata"] = json.loads(data["metadata"])
+        return StoredEvent(**data)
 
     async def append(
         self,
-        *,
-        stream_id: UUID,
-        stream_type: str,
-        events: Sequence[Dict[str, Any]],
+        stream_id: str,
+        events: list[BaseEvent],
         expected_version: int,
-        stream_metadata: Optional[Dict[str, Any]] = None,
-    ) -> List[StoredEvent]:
-        """
-        Append events to stream enforcing optimistic concurrency via expected_version.
-        expected_version is the stream version observed by the caller (0 for new stream).
-        """
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> int:
         if not events:
-            return []
+            return await self.stream_version(stream_id)
 
         pool = self._require_pool()
-        rows: List[_AppendRow] = []
-        for e in events:
-            rows.append(
-                _AppendRow(
-                    event_type=e["event_type"],
-                    event_version=int(e.get("event_version", 1)),
-                    occurred_at=e["occurred_at"],
-                    payload=dict(e["payload"]),
-                    metadata=dict(e.get("metadata") or {}),
-                    correlation_id=e.get("correlation_id"),
-                    causation_id=e.get("causation_id"),
-                )
-            )
-
         async with pool.acquire() as conn:
             async with conn.transaction():
+                stream = await conn.fetchrow(
+                    "SELECT stream_id, current_version, archived_at FROM event_streams WHERE stream_id=$1 FOR UPDATE",
+                    stream_id,
+                )
+                if stream is None:
+                    if expected_version != -1:
+                        raise OptimisticConcurrencyError(stream_id, expected_version, 0)
+                    aggregate_type = stream_id.split("-", 1)[0]
+                    await conn.execute(
+                        "INSERT INTO event_streams(stream_id, aggregate_type, current_version) VALUES ($1,$2,0)",
+                        stream_id,
+                        aggregate_type,
+                    )
+                    current_version = 0
+                else:
+                    if stream["archived_at"] is not None:
+                        raise RuntimeError(f"Stream {stream_id} is archived.")
+                    current_version = int(stream["current_version"])
+                    if current_version != expected_version:
+                        raise OptimisticConcurrencyError(stream_id, expected_version, current_version)
+
+                next_version = current_version
+                for event in events:
+                    next_version += 1
+                    metadata: dict[str, Any] = {"occurred_at": event.occurred_at.isoformat()}
+                    if correlation_id:
+                        metadata["correlation_id"] = correlation_id
+                    if causation_id:
+                        metadata["causation_id"] = causation_id
+
+                    rec = await conn.fetchrow(
+                        """
+                        INSERT INTO events(stream_id, stream_position, event_type, event_version, payload, metadata)
+                        VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb)
+                        RETURNING event_id, payload
+                        """,
+                        stream_id,
+                        next_version,
+                        event.event_type,
+                        event.event_version,
+                        json.dumps(event.to_payload()),
+                        json.dumps(metadata),
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO outbox(event_id, destination, payload)
+                        VALUES ($1, $2, $3::jsonb)
+                        """,
+                        rec["event_id"],
+                        event.event_type,
+                        json.dumps(event.to_payload()),
+                    )
+
                 await conn.execute(
                     """
-                    INSERT INTO event_streams(stream_id, stream_type, metadata)
-                    VALUES ($1, $2, COALESCE($3::jsonb, '{}'::jsonb))
-                    ON CONFLICT (stream_id) DO NOTHING
+                    UPDATE event_streams SET current_version=$2 WHERE stream_id=$1
                     """,
                     stream_id,
-                    stream_type,
-                    stream_metadata,
+                    next_version,
                 )
+                return next_version
 
-                # Lock stream row to serialize appends for this stream.
-                stream_row = await conn.fetchrow(
-                    "SELECT stream_id, archived_at FROM event_streams WHERE stream_id=$1",
-                    stream_id,
-                )
-                if stream_row is None:
-                    raise RuntimeError("Stream row missing after upsert.")
-                if stream_row["archived_at"] is not None:
-                    raise RuntimeError(f"Stream {stream_id} is archived.")
-
-                inserted: List[StoredEvent] = []
-                next_version = expected_version
-                for r in rows:
-                    next_version += 1
-                    try:
-                        rec = await conn.fetchrow(
-                            """
-                            INSERT INTO events(
-                              stream_id, version, event_type, event_version, occurred_at,
-                              payload, metadata, correlation_id, causation_id
-                            )
-                            VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9)
-                            RETURNING event_id, stream_id, version, event_type, event_version,
-                                      occurred_at, payload, metadata, correlation_id, causation_id
-                            """,
-                            stream_id,
-                            next_version,
-                            r.event_type,
-                            r.event_version,
-                            r.occurred_at,
-                            r.payload,
-                            r.metadata,
-                            r.correlation_id,
-                            r.causation_id,
-                        )
-                        await conn.execute(
-                            """
-                            INSERT INTO outbox (event_id, stream_id, topic, payload, occurred_at)
-                            VALUES ($1, $2, $3, $4::jsonb, $5)
-                            """,
-                            rec["event_id"],
-                            rec["stream_id"],
-                            rec["event_type"],
-                            rec["payload"],
-                            rec["occurred_at"],
-                        )
-                    except asyncpg.exceptions.UniqueViolationError as e:
-                        if e.constraint_name == "events_stream_version_unique":
-                            actual_version_row = await conn.fetchrow(
-                                "SELECT COALESCE(MAX(version), 0) AS v FROM events WHERE stream_id=$1",
-                                stream_id,
-                            )
-                            actual_version = int(actual_version_row["v"]) if actual_version_row else 0
-                            raise OptimisticConcurrencyError(stream_id, expected_version, actual_version) from e
-                        raise
-                        
-                    inserted.append(
-                        StoredEvent(
-                            event_id=rec["event_id"],
-                            stream_id=rec["stream_id"],
-                            version=rec["version"],
-                            event_type=rec["event_type"],
-                            event_version=rec["event_version"],
-                            occurred_at=rec["occurred_at"],
-                            payload=dict(rec["payload"]),
-                            metadata=dict(rec["metadata"] or {}),
-                            correlation_id=rec["correlation_id"],
-                            causation_id=rec["causation_id"],
-                        )
-                    )
-                return inserted
-
-    async def load_stream(self, stream_id: UUID, *, from_version: int = 1) -> List[StoredEvent]:
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT event_id, stream_id, version, event_type, event_version, occurred_at,
-                       payload, metadata, correlation_id, causation_id
-                FROM events
-                WHERE stream_id = $1 AND version >= $2
-                ORDER BY version ASC
-                """,
-                stream_id,
-                from_version,
-            )
-            return [
-                StoredEvent(
-                    event_id=r["event_id"],
-                    stream_id=r["stream_id"],
-                    version=r["version"],
-                    event_type=r["event_type"],
-                    event_version=r["event_version"],
-                    occurred_at=r["occurred_at"],
-                    payload=dict(r["payload"]),
-                    metadata=dict(r["metadata"] or {}),
-                    correlation_id=r["correlation_id"],
-                    causation_id=r["causation_id"],
-                )
-                for r in rows
-            ]
-
-    async def load_all(
+    async def load_stream(
         self,
-        *,
-        since: Optional[datetime] = None,
-        limit: int = 1000,
-    ) -> List[StoredEvent]:
+        stream_id: str,
+        from_position: int = 0,
+        to_position: int | None = None,
+    ) -> list[StoredEvent]:
         pool = self._require_pool()
         async with pool.acquire() as conn:
-            if since is None:
+            if to_position is None:
                 rows = await conn.fetch(
                     """
-                    SELECT event_id, stream_id, version, event_type, event_version, occurred_at,
-                           payload, metadata, correlation_id, causation_id
+                    SELECT event_id, stream_id, stream_position, global_position, event_type, event_version, payload, metadata, recorded_at
                     FROM events
-                    ORDER BY occurred_at ASC
-                    LIMIT $1
+                    WHERE stream_id=$1 AND stream_position > $2
+                    ORDER BY stream_position ASC
                     """,
-                    limit,
+                    stream_id,
+                    from_position,
                 )
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT event_id, stream_id, version, event_type, event_version, occurred_at,
-                           payload, metadata, correlation_id, causation_id
+                    SELECT event_id, stream_id, stream_position, global_position, event_type, event_version, payload, metadata, recorded_at
                     FROM events
-                    WHERE occurred_at >= $1
-                    ORDER BY occurred_at ASC
-                    LIMIT $2
+                    WHERE stream_id=$1 AND stream_position > $2 AND stream_position <= $3
+                    ORDER BY stream_position ASC
                     """,
-                    since,
-                    limit,
+                    stream_id,
+                    from_position,
+                    to_position,
                 )
-            return [
-                StoredEvent(
-                    event_id=r["event_id"],
-                    stream_id=r["stream_id"],
-                    version=r["version"],
-                    event_type=r["event_type"],
-                    event_version=r["event_version"],
-                    occurred_at=r["occurred_at"],
-                    payload=dict(r["payload"]),
-                    metadata=dict(r["metadata"] or {}),
-                    correlation_id=r["correlation_id"],
-                    causation_id=r["causation_id"],
-                )
-                for r in rows
-            ]
+            events = [self._row_to_event(row) for row in rows]
+            if self._upcaster_registry is None:
+                return events
+            return [self._upcaster_registry.upcast(e) for e in events]
 
-    async def iter_all(
+    async def load_all(
         self,
-        *,
-        batch_size: int = 1000,
+        from_global_position: int = 0,
+        event_types: list[str] | None = None,
+        batch_size: int = 500,
     ) -> AsyncIterator[StoredEvent]:
-        offset_event_time: Optional[datetime] = None
-        while True:
-            batch = await self.load_all(since=offset_event_time, limit=batch_size)
-            if not batch:
-                return
-            for e in batch:
-                yield e
-            offset_event_time = batch[-1].occurred_at
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            last = from_global_position
+            while True:
+                params: list[Any] = [last]
+                q = """
+                    SELECT event_id, stream_id, stream_position, global_position, event_type, event_version, payload, metadata, recorded_at
+                    FROM events
+                    WHERE global_position > $1
+                """
+                if event_types:
+                    q += " AND event_type = ANY($2)"
+                    params.append(event_types)
+                    q += " ORDER BY global_position ASC LIMIT $3"
+                    params.append(batch_size)
+                else:
+                    q += " ORDER BY global_position ASC LIMIT $2"
+                    params.append(batch_size)
+                rows = await conn.fetch(
+                    q,
+                    *params,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    evt = self._row_to_event(row)
+                    if self._upcaster_registry is not None:
+                        evt = self._upcaster_registry.upcast(evt)
+                    last = evt.global_position
+                    yield evt
+
+    async def stream_version(self, stream_id: str) -> int:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT current_version FROM event_streams WHERE stream_id=$1",
+                stream_id,
+            )
+            return int(row["current_version"]) if row else 0
+
+    async def archive_stream(self, stream_id: str) -> None:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE event_streams SET archived_at=NOW() WHERE stream_id=$1", stream_id)
+
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT stream_id, aggregate_type, current_version, created_at, archived_at, metadata
+                FROM event_streams WHERE stream_id=$1
+                """,
+                stream_id,
+            )
+            return StreamMetadata(**dict(row)) if row else None

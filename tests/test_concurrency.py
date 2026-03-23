@@ -1,12 +1,11 @@
 import asyncio
 import os
-from uuid import uuid4
 
 import asyncpg
 import pytest
 
 from src.event_store import EventStore
-from src.models.events import ApplicationSubmitted, DecisionGenerated, OptimisticConcurrencyError
+from src.models.events import BaseEvent, OptimisticConcurrencyError
 
 
 def _dsn() -> str | None:
@@ -31,36 +30,34 @@ async def test_double_decision_concurrency_expected_version_3():
     await store.connect()
     try:
         # Ensure schema exists.
-        async with asyncpg.connect(dsn) as conn:
+        conn = await asyncpg.connect(dsn)
+        try:
             await _apply_schema(conn)
             # Clean tables for repeatability.
             await conn.execute("TRUNCATE TABLE outbox RESTART IDENTITY CASCADE")
             await conn.execute("TRUNCATE TABLE events RESTART IDENTITY CASCADE")
             await conn.execute("TRUNCATE TABLE event_streams RESTART IDENTITY CASCADE")
+        finally:
+            await conn.close()
 
-        stream_id = uuid4()
+        stream_id = "loan-concurrency-test"
 
         # Seed 3 events so stream_version == 3.
-        seed = [
-            ApplicationSubmitted(
-                application_id=stream_id,
-                applicant_id=uuid4(),
-                amount=10000,
-                term_months=12,
-            ).to_storable(),
-            DecisionGenerated(application_id=stream_id, decision="APPROVE", rationale="seed-1").to_storable(),
-            DecisionGenerated(application_id=stream_id, decision="APPROVE", rationale="seed-2").to_storable(),
-        ]
-        await store.append(stream_id=stream_id, stream_type="LoanApplication", events=seed, expected_version=0)
+        class SeedEvent(BaseEvent):
+            event_type = "SeedEvent"
+            value: str
+
+        await store.append(stream_id=stream_id, events=[SeedEvent(value="1")], expected_version=-1)
+        await store.append(stream_id=stream_id, events=[SeedEvent(value="2")], expected_version=1)
+        await store.append(stream_id=stream_id, events=[SeedEvent(value="3")], expected_version=2)
 
         assert await store.stream_version(stream_id) == 3
 
         async def contender(label: str):
-            ev = DecisionGenerated(application_id=stream_id, decision="DECLINE", rationale=label).to_storable()
+            event = SeedEvent(value=label)
             return await store.append(
                 stream_id=stream_id,
-                stream_type="LoanApplication",
-                events=[ev],
+                events=[event],
                 expected_version=3,
             )
 
@@ -81,7 +78,9 @@ async def test_double_decision_concurrency_expected_version_3():
         assert err.expected_version == 3
         assert err.actual_version == 4
         assert await store.stream_version(stream_id) == 4
-        assert len(await store.load_stream(stream_id)) == 4
+        loaded = await store.load_stream(stream_id)
+        assert len(loaded) == 4
+        assert loaded[-1].stream_position == 4
     finally:
         await store.close()
 

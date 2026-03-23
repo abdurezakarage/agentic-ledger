@@ -1,62 +1,54 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional
-from uuid import UUID
+from typing import Optional
 
-from src.models.events import AgentSessionStarted, DomainError, StoredEvent, decode_event
+from src.event_store import EventStore
+from src.models.events import DomainError, StoredEvent
 
 
 @dataclass
 class AgentSessionAggregate:
-    session_id: UUID
-    agent_id: Optional[UUID] = None
+    agent_id: str
+    session_id: str
     model_version: Optional[str] = None
-    gas_town_context_id: Optional[UUID] = None
-    token_budget: int = 0
-    started: bool = False
+    context_loaded: bool = False
+    applications_seen: set[str] | None = None
     version: int = 0
 
-    def load(self, stored_events: Iterable[StoredEvent]) -> None:
-        for se in stored_events:
-            ev = decode_event(se.event_type, se.payload, occurred_at=se.occurred_at)
-            self._apply(ev)
-            self.version = se.version
+    def __post_init__(self) -> None:
+        if self.applications_seen is None:
+            self.applications_seen = set()
 
-    def start(self, *, agent_id: UUID, model_version: str, gas_town_context_id: UUID, token_budget: int) -> AgentSessionStarted:
-        if self.started:
-            raise DomainError("Session already started.")
-        if not model_version:
-            raise DomainError("model_version required")
-        if token_budget <= 0:
-            raise DomainError("token_budget must be positive")
-        return AgentSessionStarted(
-            session_id=self.session_id,
-            agent_id=agent_id,
-            model_version=model_version,
-            gas_town_context_id=gas_town_context_id,
-            token_budget=token_budget,
-        )
+    @classmethod
+    async def load(cls, store: EventStore, agent_id: str, session_id: str) -> "AgentSessionAggregate":
+        agg = cls(agent_id=agent_id, session_id=session_id)
+        for event in await store.load_stream(f"agent-{agent_id}-{session_id}"):
+            agg._apply(event)
+        return agg
 
-    def enforce_gas_town(self, *, gas_town_context_id: UUID, model_version: str) -> None:
-        if not self.started:
-            raise DomainError("Session not started.")
-        if self.gas_town_context_id != gas_town_context_id:
-            raise DomainError("Gas Town context mismatch.")
-        if self.model_version != model_version:
-            raise DomainError("Model version mismatch (locked).")
+    def assert_context_loaded(self) -> None:
+        if not self.context_loaded:
+            raise DomainError("Agent context must be loaded before decisions")
 
-    def _apply(self, event: object) -> None:
-        event_type = event.__class__.event_type
-        handler = getattr(self, f"_apply_{event_type.lower()}", None)
+    def assert_model_version_current(self, model_version: str) -> None:
+        if self.model_version and self.model_version != model_version:
+            raise DomainError("Model version mismatch for locked session")
+
+    def _apply(self, event: StoredEvent) -> None:
+        handler = getattr(self, f"_on_{event.event_type}", None)
         if handler is None:
-            raise DomainError(f"Missing apply handler for {event_type}")
+            self.version = event.stream_position
+            return
         handler(event)
+        self.version = event.stream_position
 
-    def _apply_agentsessionstarted(self, e: AgentSessionStarted) -> None:
-        self.started = True
-        self.agent_id = e.agent_id
-        self.model_version = e.model_version
-        self.gas_town_context_id = e.gas_town_context_id
-        self.token_budget = e.token_budget
+    def _on_AgentContextLoaded(self, event: StoredEvent) -> None:
+        self.context_loaded = True
+        self.model_version = event.payload.get("model_version")
+
+    def _on_CreditAnalysisCompleted(self, event: StoredEvent) -> None:
+        app_id = event.payload.get("application_id")
+        if app_id:
+            self.applications_seen.add(app_id)
 

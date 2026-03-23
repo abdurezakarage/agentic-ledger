@@ -1,6 +1,12 @@
-## TRP1 Week 5 — Interim Deliverables (Minimum)
+## TRP1 Week 5 — Final Submission Scaffold
 
-This repo contains the **interim** implementation of the Ledger core: Postgres schema, an async event store with **optimistic concurrency**, minimal domain aggregates, command handlers, and the required concurrency test.
+This repository now includes a full Week 5 implementation scaffold for:
+- Phase 1: event store core + optimistic concurrency + outbox
+- Phase 2: aggregates and command handlers
+- Phase 3: projections + async daemon
+- Phase 4: upcasting + integrity + Gas Town recovery
+- Phase 5: MCP command/resource layer
+- Phase 6: what-if and regulatory package stubs
 
 ### Setup
 
@@ -32,12 +38,21 @@ uv run python -m src.migrate
 uv run pytest -q
 ```
 
-### Interim deliverables map
+### Deliverables map
 
-- **Schema**: `src/schema.sql`
-- **Event store**: `src/event_store.py`
-- **Models & catalogue**: `src/models/events.py`
-- **Aggregates**: `src/aggregates/loan_application.py`, `src/aggregates/agent_session.py`
-- **Command handlers**: `src/commands/handlers.py`
-- **Concurrency test**: `tests/test_concurrency.py`
+- **Core**: `src/schema.sql`, `src/event_store.py`, `src/models/events.py`
+- **Aggregates**: `src/aggregates/*.py`
+- **Commands**: `src/commands/handlers.py`
+- **Projections**: `src/projections/*.py`
+- **Upcasting**: `src/upcasting/*.py`
+- **Integrity / Gas Town**: `src/integrity/*.py`
+- **MCP layer**: `src/mcp/*.py`
+- **Bonus**: `src/what_if/projector.py`, `src/regulatory/package.py`
+- **Docs**: `DOMAIN_NOTES.md`, `DESIGN.md`
+- **Tests**: `tests/test_*.py`
+
+### Notes
+
+- Tests are database-backed and require `DATABASE_URL`.
+- If `DATABASE_URL` is missing, tests skip by design.
 
