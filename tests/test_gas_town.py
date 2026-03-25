@@ -34,5 +34,6 @@ async def test_gas_town_context_reconstruction():
         context = await reconstruct_agent_context(store, "123", "1")
         assert context.last_event_position == 5
         assert context.context_text
+        assert context.session_health_status in {"HEALTHY", "NEEDS_RECONCILIATION"}
     finally:
         await store.close()

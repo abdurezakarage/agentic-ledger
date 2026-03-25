@@ -46,6 +46,11 @@ class LoanApplicationAggregate:
         if not self.compliance_cleared:
             raise DomainError("Cannot approve without compliance clearance")
 
+    def enforce_confidence_floor(self, recommendation: str, confidence_score: float) -> str:
+        if confidence_score < 0.6:
+            return "REFER"
+        return recommendation
+
     def _on_ApplicationSubmitted(self, event: StoredEvent) -> None:
         self._require_transition(None)
         self.state = ApplicationState.SUBMITTED

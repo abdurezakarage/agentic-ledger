@@ -2,12 +2,3 @@
 .venv/
 __pycache__/
 .pytest_cache/
-.coverage
-.coverage.*
-.coverage.xml
-.coverage.json
-.coverage.json.gz
-.coverage.json.bz2
-.coverage.json.lzma
-.coverage.json.zstd
-.coverage.json.xz

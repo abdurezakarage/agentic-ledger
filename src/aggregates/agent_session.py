@@ -35,6 +35,10 @@ class AgentSessionAggregate:
         if self.model_version and self.model_version != model_version:
             raise DomainError("Model version mismatch for locked session")
 
+    def assert_processed_application(self, application_id: str) -> None:
+        if application_id not in self.applications_seen:
+            raise DomainError("Contributing session has no decision event for this application")
+
     def _apply(self, event: StoredEvent) -> None:
         if event.stream_position == 1 and event.event_type != "AgentContextLoaded":
             raise DomainError("First AgentSession event must be AgentContextLoaded")

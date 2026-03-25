@@ -23,10 +23,20 @@ async def reconstruct_agent_context(
     if not events:
         return AgentContext("", 0, [], "EMPTY")
     last = events[-1]
-    lines = [f"{e.event_type}: {e.payload}" for e in events[-3:]]
+    preserved = events[-3:]
+    preserved_lines = [f"{e.event_type}: {e.payload}" for e in preserved]
     pending = [e.event_type for e in events if "PENDING" in e.event_type.upper() or "ERROR" in e.event_type.upper()]
-    status = "NEEDS_RECONCILIATION" if "Partial" in last.event_type else "HEALTHY"
-    text = "\n".join(lines)
+
+    older = events[:-3]
+    # Token-efficient prose summary of older events (one line each).
+    summary_lines = [f"- {e.event_type}" for e in older]
+    text = "\n".join(["Summary:"] + summary_lines + ["", "Last events:"] + preserved_lines).strip()
+
+    # Partial state detection heuristic: a decision event without a corresponding completion event after it.
+    last_is_partial = last.event_type in {"DecisionGenerated"} and not any(
+        e.event_type in {"HumanReviewCompleted", "ApplicationApproved", "ApplicationDeclined"} for e in preserved
+    )
+    status = "NEEDS_RECONCILIATION" if last_is_partial else "HEALTHY"
     if len(text) > token_budget:
         text = text[:token_budget]
     return AgentContext(

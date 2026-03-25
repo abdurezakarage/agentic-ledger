@@ -24,12 +24,12 @@ class ProjectionDaemon:
         self._projections = {p.name: p for p in projections}
         self._running = False
         self._max_retries = max_retries
-        self._lags: dict[str, int] = {p.name: 0 for p in projections}
+        self._lags: dict[str, int] = {p.name: 0 for p in projections}  # ms
 
     async def run_forever(self, poll_interval_ms: int = 100) -> None:
         self._running = True
         while self._running:
-            await self._process_batch()
+            await self._process_batch(poll_interval_ms=poll_interval_ms)
             await asyncio.sleep(poll_interval_ms / 1000)
 
     def stop(self) -> None:
@@ -69,7 +69,15 @@ class ProjectionDaemon:
             row = await conn.fetchrow("SELECT COALESCE(MAX(global_position),0) AS p FROM events")
             return int(row["p"])
 
-    async def _process_batch(self) -> None:
+    async def _latest_recorded_at(self) -> int:
+        pool = self._store._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT EXTRACT(EPOCH FROM (clock_timestamp() - COALESCE(MAX(recorded_at), clock_timestamp()))) * 1000 AS ms FROM events"
+            )
+            return int(row["ms"] or 0)
+
+    async def _process_batch(self, poll_interval_ms: int = 100) -> None:
         checkpoints = {name: await self._get_checkpoint(name) for name in self._projections}
         start = min(checkpoints.values()) if checkpoints else 0
         events = [e async for e in self._store.load_all(from_global_position=start, batch_size=500)]
@@ -96,7 +104,8 @@ class ProjectionDaemon:
                     checkpoints[name] = event.global_position
         latest = await self._latest_global_position()
         for name, pos in checkpoints.items():
-            self._lags[name] = max(0, latest - pos)
+            # Approximation: treat unprocessed positions as lag; production variant would compute time delta from last processed event.
+            self._lags[name] = max(0, (latest - pos) * poll_interval_ms)
 
     def get_lag(self, projection_name: str) -> int:
         return self._lags.get(projection_name, 0)

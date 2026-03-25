@@ -126,6 +126,10 @@ async def handle_compliance_check(
         "rule_version": rule_version,
     }
     await _append(store, f"compliance-{application_id}", event_type, payload, agg.version if agg.version else -1)
+    # Mirror compliance signal on the loan stream so the LoanApplication aggregate can enforce dependency rules
+    app = await LoanApplicationAggregate.load(store, application_id)
+    if passed:
+        await _append(store, f"loan-{application_id}", "ComplianceRulePassed", payload, app.version)
 
 
 async def handle_generate_decision(
@@ -140,6 +144,7 @@ async def handle_generate_decision(
     if recommendation == "APPROVE":
         compliance = await ComplianceRecordAggregate.load(store, application_id)
         compliance.assert_all_mandatory_checks_passed()
+        app.assert_compliance_ready_for_approval()
     for session_stream in contributing_agent_sessions:
         parts = session_stream.split("-")
         if len(parts) < 3:
@@ -147,10 +152,8 @@ async def handle_generate_decision(
         agent_id = parts[1]
         session_id = "-".join(parts[2:])
         session = await AgentSessionAggregate.load(store, agent_id, session_id)
-        if application_id not in session.applications_seen:
-            raise DomainError("Contributing session has no decision event for this application")
-    if confidence_score < 0.6:
-        recommendation = "REFER"
+        session.assert_processed_application(application_id)
+    recommendation = app.enforce_confidence_floor(recommendation, confidence_score)
     await _append(
         store,
         f"loan-{application_id}",
